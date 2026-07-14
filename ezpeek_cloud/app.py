@@ -1,9 +1,14 @@
 """
-ezpeek cloud API + reverse-proxy control plane.
+ezpeek cloud API + reverse-proxy control plane + STUN/TURN.
 
 Run:
   uvicorn app:app --host 0.0.0.0 --port 8787
-Relay TCP on 8788 started alongside.
+Relay TCP on 8788 and STUN/TURN UDP on 3478 start alongside.
+
+Clients dial OUT only — no inbound ports required on user machines:
+  - 8787  HTTP API (auth / friends / presence / ice)
+  - 8788  TCP reverse-proxy (control + video channels)
+  - 3478  STUN (public address) + TURN (UDP relay when enabled)
 """
 
 from __future__ import annotations
@@ -13,7 +18,6 @@ import json
 import logging
 import os
 import secrets
-import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -36,10 +40,37 @@ JWT_ALG = "HS256"
 API_PORT = int(os.environ.get("EZPEEK_API_PORT", "8787"))
 RELAY_PORT = int(os.environ.get("EZPEEK_RELAY_PORT", "8788"))
 PUBLIC_HOST = os.environ.get("EZPEEK_PUBLIC_HOST", "162.35.166.14")
+STUN_PORT = int(os.environ.get("EZPEEK_STUN_PORT", "3478"))
+# TURN on by default so symmetric NATs can relay UDP without opening home ports.
+TURN_ENABLED = os.environ.get("EZPEEK_TURN_ENABLED", "1").strip() not in ("0", "false", "no")
+TURN_REALM = os.environ.get("EZPEEK_TURN_REALM", "ezpeek")
+# Shared long-term TURN password (issued to logged-in clients via GET /ice).
+TURN_USER = os.environ.get("EZPEEK_TURN_USER", "ezpeek")
+
+
+def _load_or_create_turn_password() -> str:
+    env = os.environ.get("EZPEEK_TURN_PASSWORD")
+    if env:
+        return env
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "turn.password"
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    pw = secrets.token_hex(16)
+    path.write_text(pw + "\n", encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    return pw
+
+
+TURN_PASSWORD = _load_or_create_turn_password()
 
 crypto = CryptoBox(DATA_DIR)
 db = Database(DATA_DIR / "ezpeek.db", crypto)
 hub = RelayHub(auth_lookup=lambda t: None)  # patched in lifespan
+_stun_turn = None  # set in lifespan
 
 
 def _user_from_token(token: str) -> Optional[dict]:
@@ -76,23 +107,64 @@ def _are_friends(a: int, b: int) -> bool:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _stun_turn
     hub.auth_lookup = _user_from_token
     hub.resolve_username = _resolve_username
     hub.are_friends = _are_friends
 
     loop = asyncio.get_event_loop()
     relay_task = loop.create_task(start_relay_server(hub, port=RELAY_PORT))
-    logger.info("API ready; data=%s public=%s", DATA_DIR, PUBLIC_HOST)
+
+    # STUN (+ optional TURN) on UDP so clients need zero inbound ports at home.
+    try:
+        from .stun_turn_svc import StunTurnServer
+
+        _stun_turn = StunTurnServer(
+            host="0.0.0.0",
+            port=STUN_PORT,
+            realm=TURN_REALM,
+            enable_turn=TURN_ENABLED,
+            relay_ip=PUBLIC_HOST,
+        )
+        if TURN_ENABLED:
+            _stun_turn.credentials.add_credential(TURN_USER, TURN_PASSWORD)
+            # Also accept JWT-secret-derived password for username == ezpeek user
+            _stun_turn.credentials.add_credential("ezpeek-turn", TURN_PASSWORD)
+        await _stun_turn.start()
+        logger.info(
+            "STUN%s on UDP %s (realm=%s public=%s)",
+            "+TURN" if TURN_ENABLED else "",
+            STUN_PORT,
+            TURN_REALM,
+            PUBLIC_HOST,
+        )
+    except Exception as e:
+        logger.exception("STUN/TURN failed to start: %s", e)
+        _stun_turn = None
+
+    logger.info(
+        "API ready; data=%s public=%s api=%s relay=%s stun=%s",
+        DATA_DIR,
+        PUBLIC_HOST,
+        API_PORT,
+        RELAY_PORT,
+        STUN_PORT,
+    )
     yield
     relay_task.cancel()
     try:
         await relay_task
     except Exception:
         pass
+    if _stun_turn is not None:
+        try:
+            await _stun_turn.stop()
+        except Exception:
+            pass
     db.close()
 
 
-app = FastAPI(title="ezpeek cloud", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="ezpeek cloud", version="0.4.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -152,14 +224,50 @@ def _issue_token(user_id: int, username: str) -> str:
 
 
 # ---------- routes ----------
+def _ice_payload(*, include_turn_secrets: bool = False) -> dict:
+    """ICE / connectivity config for clients (no home firewall holes)."""
+    stun_url = f"stun:{PUBLIC_HOST}:{STUN_PORT}"
+    out: dict = {
+        "public_host": PUBLIC_HOST,
+        "api_port": API_PORT,
+        "relay": {
+            "host": PUBLIC_HOST,
+            "port": RELAY_PORT,
+            "channels": ["control", "video"],
+            "note": "Both peers dial out over TCP; server pairs streams. No inbound ports on clients.",
+        },
+        "stun": [
+            {"urls": stun_url, "host": PUBLIC_HOST, "port": STUN_PORT},
+        ],
+        "turn_enabled": TURN_ENABLED and _stun_turn is not None,
+        "stun_running": _stun_turn is not None,
+    }
+    if TURN_ENABLED and _stun_turn is not None:
+        turn_url = f"turn:{PUBLIC_HOST}:{STUN_PORT}?transport=udp"
+        turn_entry: dict = {
+            "urls": turn_url,
+            "host": PUBLIC_HOST,
+            "port": STUN_PORT,
+            "realm": TURN_REALM,
+        }
+        if include_turn_secrets:
+            turn_entry["username"] = TURN_USER
+            turn_entry["credential"] = TURN_PASSWORD
+        out["turn"] = [turn_entry]
+    else:
+        out["turn"] = []
+    return out
+
+
 @app.get("/")
 def root():
     """Browser-friendly landing (avoids bare FastAPI {'detail':'Not Found'})."""
     return {
         "service": "ezpeek-cloud",
         "status": "ok",
-        "message": "EzPeek auth / friends / relay API. Use the EzPeek app to sign in.",
+        "message": "EzPeek auth / friends / TCP relay / STUN-TURN API. Use the EzPeek app to sign in.",
         "health": "/health",
+        "ice": "/ice (auth required for TURN credentials)",
         "docs": "/docs",
         "auth": {
             "register": "POST /auth/register",
@@ -174,6 +282,8 @@ def root():
         "public_host": PUBLIC_HOST,
         "api_port": API_PORT,
         "relay_port": RELAY_PORT,
+        "stun_port": STUN_PORT,
+        "turn_enabled": TURN_ENABLED,
     }
 
 
@@ -185,6 +295,9 @@ def health():
         "public_host": PUBLIC_HOST,
         "api_port": API_PORT,
         "relay_port": RELAY_PORT,
+        "stun_port": STUN_PORT,
+        "stun_running": _stun_turn is not None,
+        "turn_enabled": TURN_ENABLED and _stun_turn is not None,
     }
 
 
@@ -223,6 +336,18 @@ def me(user=Depends(current_user)):
 def logout(user=Depends(current_user)):
     db.delete_session(user["token"])
     return {"ok": True}
+
+
+@app.get("/ice")
+def ice_config(user=Depends(current_user)):
+    """
+    Return STUN/TURN + TCP relay endpoints for the logged-in client.
+
+    Clients only need *outbound* access to these server ports — no inbound
+    firewall rules on user machines for cloud remoting.
+    """
+    _ = user
+    return _ice_payload(include_turn_secrets=True)
 
 
 @app.post("/friends/add")
@@ -277,6 +402,7 @@ def friend_connect(username: str, user=Depends(current_user)):
         ips = json.loads(pres["lan_ips"] or "[]")
     except Exception:
         ips = []
+    ice = _ice_payload(include_turn_secrets=True)
     return {
         "username": friend["username"],
         "online": bool(pres["online"]),
@@ -290,7 +416,11 @@ def friend_connect(username: str, user=Depends(current_user)):
             "port": RELAY_PORT,
             # viewer authenticates with own token; host username is the friend
             "friend_username": friend["username"],
+            "channels": ["control", "video"],
         },
+        "ice": ice,
+        # Preferred remote path: TCP reverse-proxy (no client inbound ports).
+        "preferred_path": "lan" if ips else "tcp_relay",
     }
 
 
